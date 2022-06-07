@@ -218,6 +218,7 @@ $CSV | ForEach-Object {
             Stop-Process -ID $PID
         }
     }else{
+    ## Creates user accounts, no reactivation ##
         Write-Host "Creating account for $displayname" -ForegroundColor Cyan
         $NewUserParams = @{
             Path = $ADPath
