@@ -1,4 +1,4 @@
-﻿# Runs as admin
+# Runs as admin
 Write-Host "Checking for elevation... "  
 $CurrentUser = New-Object Security.Principal.WindowsPrincipal $([Security.Principal.WindowsIdentity]::GetCurrent()) 
 if (($CurrentUser.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) -eq $false) 
@@ -15,9 +15,10 @@ Write-Host "in admin mode.."
 ## Functions, messages, and modules
 $FormatEnumerationLimit = -1
 $Shell = New-Object -ComObject "WScript.Shell"
-$Shell.Popup("All user information is read from C:\scripts\ActiveDirectory\CSVs\user-creation.csv. You'll be prompted to enter user information manually if the CSV is empty (fine if creating a single user). If you need to create multiple users, pause here and enter all information into the CSV. Titles and departments are case sensitive. Click OK once complete.", 0, "Notice", 0) | Out-Null
-$Shell.Popup("Ensure you have a copy of the passwords written down somewhere for user profile setup. The CSV file is reset upon completion of the script. Click OK to acknowledge.", 0, "Notice", 0) | Out-Null
-$Shell.Popup("You'll be prompted to log into 365 multiple times for different modules used by this process. Completing connection to all modules can take some time and it may look like the script hung. Give it a bit.", 0, "Notice", 0) | Out-Null
+$Shell.Popup("All user information is read from C:\scripts\ActiveDirectory\CSVs\user-creation.csv. You'll be prompted to enter user information manually if the CSV is empty (fine if creating a single user). If you need to create multiple users, pause here and enter all information into the CSV (notepad has to run as admin to edit). Titles and departments are case sensitive (IE: A&A, Senior Manager). Click OK once complete.", 0, "Notice", 0) > $null
+$Shell.Popup("Ensure you have a copy of the passwords written down somewhere for user profile setup. The CSV file is reset upon completion of the script. Click OK to acknowledge.", 0, "Notice", 0) > $null
+$Shell.Popup("You'll be prompted to log into 365 multiple times for different modules used by this process. Completing connection to all modules can take some time and it may look like the script hung. Give it a bit.", 0, "Notice", 0) > $null
+Write-Host "Importing Modules" -ForegroundColor Cyan
 Import-Module AzureAD
 Import-Module importexcel
 Import-Module ExchangeOnlineManagement
@@ -25,6 +26,7 @@ Import-Module Microsoft.Graph.Users
 Import-Module Microsoft.Graph.Users.Actions 
 Import-Module Microsoft.Graph.Identity.DirectoryManagement
 Import-Module MicrosoftTeams
+Write-Host "Modules imported" -ForegroundColor Cyan
 Function Start-Countdown{
     <#
     .SYNOPSIS
@@ -65,10 +67,10 @@ $file = if ($env:COMPUTERNAME -eq "DomainController") {"C:\scripts\ActiveDirecto
 }elseif($env:COMPUTERNAME -eq "LocalComputer"){"Fill in path"
 }
 # Log into Microsoft
-Connect-AzureAD | Out-Null
+Connect-AzureAD > $null
 Connect-ExchangeOnline -ShowBanner:$false
-Connect-MgGraph -Scopes "User.ReadWrite.All","Directory.ReadWrite.All" | Out-Null
-Connect-MicrosoftTeams | Out-Null
+Connect-MgGraph -Scopes "User.ReadWrite.All","Directory.ReadWrite.All" > $null
+Connect-MicrosoftTeams > $null
 # Checks if there are any E3 or E5 licenses available before proceeding
 Write-Host "Getting available 365 licenses" -ForegroundColor Cyan
 Start-Sleep -Seconds 3
@@ -146,7 +148,8 @@ if ($csvcheck.firstname -eq ""){
     $csv.Title = ((Get-Culture).TextInfo).ToTitleCase(($csv.Title))  
     $csv | Export-Csv $file -NoTypeInformation
 }
-# Gets disabled users for reactivation check
+# Gets disabled users for reactivation check and checks if an account exists for any of the users being created
+$active = @(Get-ADUser -Filter * -SearchBase "Fill in OU where active users are stored" | Select-Object -ExpandProperty samaccountname)
 $disabled = @(Get-ADUser -Filter * -SearchBase "Fill in OU for where disabled users are stored" | Select-Object -ExpandProperty samaccountname)
 # Import CSV and create accounts
 $csv = Import-Csv $file
@@ -170,6 +173,10 @@ $CSV | ForEach-Object {
         $ADPath = "Fill in OU for Office2"
         $Office2Groups = @("Add any specific groups for these users")
         $DefaultGroups += $Office2Groups
+    }
+    ## Quick check for any existing active accounts with the same username ##
+    if ($active -contains $username){
+        Write-Host "An account for $DisplayName already exists. Skipping" -ForegroundColor Yellow
     }
     ## This if check is how my org identifies disabled users and prompts to reactivate if the same username is found, can be adjusted to your needs ##
     if ($disabled -contains $username+"_old" -or $disabled -contains $username) {
@@ -218,7 +225,6 @@ $CSV | ForEach-Object {
             Stop-Process -ID $PID
         }
     }else{
-    ## Creates user accounts, no reactivation ##
         Write-Host "Creating account for $displayname" -ForegroundColor Cyan
         $NewUserParams = @{
             Path = $ADPath
@@ -257,15 +263,27 @@ $CSV | ForEach-Object {
         }
     }
 }
+# Loop to run ADSync until it reports a successful sync
 Write-Host "Running ADSync" -ForegroundColor Cyan
-    Start-ADSyncSyncCycle -PolicyType Delta
-Write-Host "Searching for new users in 365. This will take a few minutes" -Foregroundcolor Cyan
-    do{
-        $ADSyncCheck = Get-AzureADUser -All $true | Where-Object {$_.userprincipalname -match $upn}
-        if ($null -ne $ADSyncCheck){
+    do {
+        Start-ADSyncSyncCycle -PolicyType Delta -OutVariable ADSyncResult -ErrorAction SilentlyContinue > $null
+        Start-Sleep -Seconds 5
+        if (($ADSyncResult | Out-String) -match "Success"){
             break
         }
-    }until($null -ne $ADSyncCheck)
+    }until(($ADSyncResult | Out-String) -match "Success")
+# Loop to get check that each new user is in Azure AD
+Write-Host "Searching for new users in 365. This will take a few minutes" -Foregroundcolor Cyan
+$csv | ForEach-Object {
+    $FirstName = $_.firstname
+    $LastName = $_.lastname
+    $username = ($FirstName[0]+$LastName).ToLower()
+    $DisplayName = $FirstName +" "+ $LastName
+    $upn = "$username@domain.com"
+    do{
+        Get-AzureADUser -All $true | Where-Object {$_.userprincipalname -match $upn} -ErrorAction SilentlyContinue
+    }until($null -ne (Get-AzureADUser -All $true | Where-Object {$_.userprincipalname -match $upn}))
+}
 # New loop to configure user in 365 after pause for ADSync to complete
 $csv | ForEach-Object {
     $FirstName = $_.firstname
@@ -295,16 +313,23 @@ $csv | ForEach-Object {
         ## Org specific;; we set all users calendars as read-only so everyone can view availability. Remove as needed ##
         $usermailbox = $mailbox.PrimarySmtpAddress
         Set-MailboxFolderPermission -identity $usermailbox":\Calendar" -User Default -AccessRights Reviewer -Verbose
-        ## Org specific; we use Teams for our phone system and this part queries for the assigned Teams number to add to AD. Does not add the Teams number as it needs to be added manually through our provider. Remove/modify as needed ##
-        Write-Host "Searching for number assigned to $DisplayName for up to 3 minutes. Please wait" -Foregroundcolor Cyan
-        $timeout = New-TimeSpan -Seconds 180
-        $endtime = (Get-Date).add($timeout)
-        do{
-            $teamsdirectget = Get-CSOnlineUser -Identity $username | Select-Object -ExpandProperty LineURI -ea 0
-            if ($null -ne $teamsdirectget){
-                break
-            }
-        }until($null -ne $teamsdirectget -or (Get-Date) -gt $endtime)
+    }
+## Org specific; we use Teams for our phone system and this part queries for the assigned Teams number to add to AD. Does not add the Teams number as it needs to be added manually through our provider. Remove/modify as needed ##
+## Loop is now separate so that all users are licensed first before querying for Teams numbers ##
+$csv | ForEach-Object {
+    $FirstName = $_.firstname
+    $LastName = $_.lastname
+    $username = ($FirstName[0]+$LastName).ToLower()
+    $DisplayName = $FirstName +" "+ $LastName
+    Write-Host "Searching for number assigned to $DisplayName for up to 3 minutes. Please wait" -Foregroundcolor Cyan
+    $timeout = New-TimeSpan -Seconds 180
+    $endtime = (Get-Date).add($timeout)
+    do{
+        $teamsdirectget = Get-CSOnlineUser -Identity $username | Select-Object -ExpandProperty LineURI -ea 0
+        if ($null -ne $teamsdirectget){
+            break
+        }
+    }until($null -ne $teamsdirectget -or (Get-Date) -gt $endtime)
     if ($null -eq $teamsdirectget){
         Write-Host "No Teams number found for $DisplayName after 3 minutes. Moving to next steps. Phone attribute needs to be set manually" -ForegroundColor Magenta
     }else{Write-Host "Number found for $DisplayName, setting phone attribute" -Foregroundcolor Cyan
@@ -366,7 +391,7 @@ $params = @{
 Send-MailMessage @params
 # Resets CSV file
 Write-Host "Resetting CSV file" -Foregroundcolor Cyan
-$Shell.Popup("Double check the CSV file isn't still open, otherwise PS isn't able to reset it. Click OK once complete.", 0, "Notice", 0) | Out-Null
+$Shell.Popup("Double check the CSV file isn't still open, otherwise PS isn't able to reset it. Click OK once complete.", 0, "Notice", 0) > $null
     $csv | Select-Object * -ExcludeProperty * | Export-Csv $file -NoTypeInformation
     $headers = @(
         "Firstname"
